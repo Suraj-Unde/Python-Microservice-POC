@@ -82,15 +82,16 @@ cd Microservice-POC
 ```bash
 docker-compose up --build
 ```
-
-3. To rebuild and restart a single service after code changes:
-> ```bash
+3. To rebuild and restart a single service after code changes
+   
+ ```bash
 docker-compose up -d --no-deps --build <service-name>
-> ```
+ ```
 Example:
-> ```bash
+
+ ```bash
 docker-compose up -d --no-deps --build order-service
-> ```
+ ```
 
 4. Trigger the flow
 
