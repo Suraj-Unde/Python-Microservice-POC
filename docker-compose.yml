@@ -54,7 +54,8 @@ services:
 
   payment-service:
     build:
-      context: ./payment_service
+      context: .
+      dockerfile: payment_service/Dockerfile
     container_name: payment-service
     depends_on:
       - kafka

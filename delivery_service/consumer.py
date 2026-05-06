@@ -2,6 +2,10 @@ from kafka import KafkaConsumer
 from kafka.errors import NoBrokersAvailable
 import json
 import time
+from common.logging import get_logger
+from common.context import set_correlation_id
+
+logger = get_logger(__name__)
 
 
 def create_consumer():
@@ -20,10 +24,16 @@ def create_consumer():
 
 
 consumer = create_consumer()
+logger.info("delivery service started and listening for payment events")
 
 for msg in consumer:
     event = msg.value
+    set_correlation_id(event.get('correlation_id'))
+    logger.info("received payment event", extra={'event': event})
+
     if event['event_type'] == 'PAYMENT_SUCCESS':
-        print('Delivery assigned for order', event['order_id'])
+        logger.info("delivery assigned", extra={'order_id': event['order_id']})
     elif event['event_type'] == 'PAYMENT_FAILED':
-        print('Delivery skipped for order', event['order_id'])
+        logger.info("delivery skipped", extra={'order_id': event['order_id']})
+    else:
+        logger.info("unhandled payment event type", extra={'event_type': event['event_type'], 'order_id': event['order_id']})

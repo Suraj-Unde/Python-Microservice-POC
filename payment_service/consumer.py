@@ -3,6 +3,10 @@ from kafka.errors import NoBrokersAvailable
 import json
 import random
 import time
+from common.logging import get_logger
+from common.context import set_correlation_id
+
+logger = get_logger(__name__)
 
 
 def create_consumer():
@@ -34,10 +38,15 @@ def create_producer():
 consumer = create_consumer()
 producer = create_producer()
 processed = set()
+logger.info("payment service started and listening for orders")
 
 for msg in consumer:
     event = msg.value
+    set_correlation_id(event.get('correlation_id'))
+    logger.info("received order event", extra={'event': event})
+
     if event['event_id'] in processed:
+        logger.info("skipping duplicate order event", extra={'event_id': event['event_id']})
         continue
 
     processed.add(event['event_id'])
@@ -48,7 +57,8 @@ for msg in consumer:
             'event_type': 'PAYMENT_SUCCESS' if success else 'PAYMENT_FAILED',
             'order_id': event['order_id'],
             'event_id': event['event_id'],
+            'correlation_id': event.get('correlation_id'),
         }
         producer.send('payments', result)
         producer.flush()
-        print('Payment result:', result)
+        logger.info("payment result published", extra={'result': result})

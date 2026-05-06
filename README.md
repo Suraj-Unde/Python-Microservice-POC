@@ -83,6 +83,15 @@ cd Microservice-POC
 docker-compose up --build
 ```
 
+> To rebuild and restart a single service after code changes:
+> ```bash
+docker-compose up -d --no-deps --build <service-name>
+> ```
+> Example:
+> ```bash
+docker-compose up -d --no-deps --build order-service
+> ```
+
 3. Trigger the flow
 
 ```bash
@@ -95,6 +104,8 @@ curl -X POST http://localhost:8000/place-order
 - Payment randomly succeeds or fails
 - Delivery assigned on payment success
 - Order cancelled when payment fails
+- Structured logs with `correlation_id` across order/payment/delivery services
+- Kafka event flow from `ORDER_CREATED` → `PAYMENT_SUCCESS` / `PAYMENT_FAILED` → delivery action
 
 ## 🧪 Failure Simulation
 
@@ -112,12 +123,37 @@ This demonstrates:
 
 - Service logs across components
 - Event tracing through the flow
+- Structured JSON logs in the Order Service, Payment Service, and Delivery Service
+- Correlation ID propagation via `X-Correlation-ID`
+- Kafka event metadata in logs for better tracing
+
+Order Service now exposes Prometheus metrics at `/metrics`, including:
+
+- total orders created
+- Kafka publish success/failure counts
+- order processing latency
+
+Payment and Delivery services now log:
+
+- startup and consumer readiness
+- received Kafka events
+- event handling decisions
+- delivery assignment or skip actions
+
+Use `docker-compose logs -f order_service payment_service delivery_service` to follow the full saga execution.
+- Kafka publish success/failure counts
+- order processing latency
+
+Why Prometheus?
+
+- It collects runtime metrics automatically
+- It lets you monitor service behavior over time
+- It helps answer questions like “how many orders are processed” and “how long order creation takes”
 
 Potential extensions:
 
-- Prometheus
-- Grafana
-- OpenTelemetry
+- Grafana for dashboarding
+- OpenTelemetry for distributed traces
 
 ## 🚀 Future Improvements
 
