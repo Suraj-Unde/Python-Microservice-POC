@@ -74,7 +74,7 @@ Key principles:
 
 ```bash
 git clone <your-repo-url>
-cd Microservice-POC
+cd Python-Microservice-POC
 ```
 
 2. Start the system
