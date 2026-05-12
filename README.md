@@ -1,4 +1,4 @@
-# 🚀 Microservices Food Delivery System (Python)
+# Microservices Food Delivery System (Python)
 
 A production-style event-driven microservices system built in Python to demonstrate:
 
@@ -8,7 +8,7 @@ A production-style event-driven microservices system built in Python to demonstr
 - Failure handling and compensation
 - Observability fundamentals
 
-## 🧠 Why this project?
+## Why this project?
 
 Most tutorials explain microservices in isolation.
 This project answers the question:
@@ -22,7 +22,7 @@ Using a real-world food delivery scenario, it demonstrates:
 - Delivery assignment
 - Failure recovery using Saga
 
-## 🏗️ Architecture Overview
+## Architecture Overview
 
 Key principles:
 
@@ -30,7 +30,7 @@ Key principles:
 - Services communicate via Kafka events
 - The system is eventually consistent
 
-## 🔄 End-to-End Flow
+## End-to-End Flow
 
 1. Client places an order
 2. Order Service creates the order with status `PENDING`
@@ -38,20 +38,20 @@ Key principles:
 4. Payment Service consumes the event and processes payment
 5. Delivery Service reacts to payment success and assigns delivery
 
-## 🔁 Saga Pattern
+## Saga Pattern
 
-### ✅ Happy Path
+### Happy Path
 
 - Order → Payment → Delivery
 - Everything succeeds
 
-### ❌ Failure Handling
+### Failure Handling
 
 - Payment fails
 - Order is cancelled via compensation
 - Delivery is skipped
 
-## ⚙️ Tech Stack
+## Tech Stack
 
 - Python (FastAPI)
 - Kafka (event streaming)
@@ -59,7 +59,7 @@ Key principles:
 - Redis (idempotency - optional)
 - Docker & Docker Compose
 
-## 📦 Services
+## Services
 
 | Service          | Responsibility                          |
 | ---------------- | ----------------------------------------|
@@ -68,7 +68,7 @@ Key principles:
 | Payment Service  | Processes payment events                 |
 | Delivery Service | Assigns delivery after payment success   |
 
-## ▶️ How to Run
+## How to Run
 
 1. Clone the repository
 
@@ -99,7 +99,7 @@ docker-compose up -d --no-deps --build order-service
 curl -X POST http://localhost:8000/place-order
 ```
 
-## 🔍 What to Observe
+## What to Observe
 
 - Order created by the Order Service
 - Payment randomly succeeds or fails
@@ -108,19 +108,19 @@ curl -X POST http://localhost:8000/place-order
 - Structured logs with `correlation_id` across order/payment/delivery services
 - Kafka event flow from `ORDER_CREATED` → `PAYMENT_SUCCESS` / `PAYMENT_FAILED` → delivery action
 
-## 🧪 Failure Simulation
+## Failure Simulation
 
 The Payment Service randomly returns:
 
-- ✅ SUCCESS
-- ❌ FAILURE
+- SUCCESS
+- FAILURE
 
 This demonstrates:
 
 - Real-world unpredictability
 - System resilience
 
-## 🔎 Observability (Basic)
+## Observability (Basic)
 
 - Service logs across components
 - Event tracing through the flow
@@ -156,7 +156,7 @@ Potential extensions:
 - Grafana for dashboarding
 - OpenTelemetry for distributed traces
 
-## 🚀 Future Improvements
+## Future Improvements
 
 - Add OpenTelemetry tracing
 - Add JWT authentication
@@ -164,7 +164,7 @@ Potential extensions:
 - Add retry logic and DLQ (Dead Letter Queue)
 - Add a UI dashboard
 
-## 🎯 What this project demonstrates
+## What this project demonstrates
 
 - Real-world distributed system behavior
 - Event-driven design
