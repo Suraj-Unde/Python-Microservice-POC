@@ -1,750 +1,125 @@
-# Production-Grade Python Microservices (Deep Theory + Runnable System)
+# Architecture Review and Improvement Record
 
----
+## Scope
 
-# 🎯 What You Will Achieve
+This repository is an educational, choreography-based saga. It demonstrates
+service boundaries and asynchronous state transitions; it does not claim the
+operational guarantees of a production payment platform.
 
-This guide is designed for **all audiences (beginner → senior engineer)**.
+## Components and Ownership
 
-You will:
-- Understand microservices **from first principles**
-- Learn **why each pattern exists (not just how)**
-- Build a **fully runnable system with DB + Saga + failure handling**
-- Be able to **explain trade-offs like a system designer**
+| Component | Responsibility | Durable state |
+| --- | --- | --- |
+| API Gateway | Public routing, timeout, correlation propagation | None |
+| Order API | Atomically create orders and outbox rows | PostgreSQL |
+| Outbox worker | Relay committed order events to Kafka | PostgreSQL |
+| Order status worker | Apply payment outcomes to orders | PostgreSQL |
+| Payment worker | Simulate a stable payment result | Redis decision cache |
+| Delivery worker | React to successful payment | None (logs only) |
+| Kafka | Transport order and payment events | Kafka log |
 
----
+The Order API, outbox worker, and status worker deploy separately but form one
+service boundary. No other service accesses the orders database.
 
-# 🧠 PART 1: THEORY — SENIOR ENGINEER PERSPECTIVE (WITH REAL SYSTEM CONTEXT)
+## Improvements Applied
 
-## 1. What microservices actually are (in the context of OUR system)
+### Complete saga compensation
 
-Let’s ground everything in the system we are building: a **food delivery platform**.
+Previously, payment failure was only logged by Delivery, so orders remained
+`PENDING`. The new Order status worker consumes payment events and moves orders
+to `COMPLETED` or `CANCELLED`. Its `processed_events` table prevents duplicate
+events from applying twice.
 
-When a user places an order, a lot of things happen:
-- Order is created
-- Payment is processed
-- Delivery is assigned
+### Safer event consumption
 
-In a monolith, all of this would live in one codebase, one deployment, one database.
+Consumers now use manual offset commits. Payment commits after its result is
+acknowledged by Kafka; the Order worker commits after its database transaction;
+Delivery commits after handling. This gives at-least-once processing rather than
+silently acknowledging work before it finishes.
 
-In our system, we split this into:
-- Order Service
-- Payment Service
-- Delivery Service
+Payment decisions are stored in Redis under the source event ID. If a crash
+occurs after publishing but before committing the Kafka offset, the retry emits
+the same payment event and outcome. Each derived event has a new `event_id` and
+uses `causation_id` to point to its source.
 
-👉 Each of these is a **microservice**.
+### Transactional outbox
 
-But the important part is not “separate services”.
+Order creation and `ORDER_CREATED` persistence now happen in one PostgreSQL
+transaction. A separate relay locks pending rows with `SKIP LOCKED`, publishes
+them, and records `published_at`. A crash after Kafka acknowledgement but before
+the database update can still duplicate an event, so consumers remain
+idempotent.
 
-👉 The important part is:
-Each service owns:
-- Its **business logic**
-- Its **data**
-- Its **failures**
+### Versioned contracts and rejection
 
-For example:
-- Order Service does NOT know how payment works
-- Payment Service does NOT care how delivery is assigned
+All domain events share a validated version 1 envelope. Structurally invalid
+events are wrapped as `EVENT_REJECTED` and sent to `orders-dlq` or
+`payments-dlq`; source offsets commit only after the dead-letter publish is
+acknowledged. Contract unit tests cover creation, versions, required fields, and
+rejection context.
 
-This separation is what gives us flexibility—but also complexity.
+### Gateway resilience
 
----
+The gateway now:
 
-## 2. Why teams move away from monoliths (seen through our POC)
+- bounds calls to the Order API with a timeout;
+- maps connection failures to HTTP `503`;
+- preserves upstream status codes and correlation IDs;
+- exposes order lookup and a health endpoint.
 
-Let’s imagine our system as a monolith.
+### Configuration and deployment
 
-### Scenario:
-Payment logic has a bug.
+Service URLs, Kafka brokers, Redis, database URL, and timeout are environment
+configured. PostgreSQL readiness gates the Order processes. Fixed container
+names were removed so Compose services can be scaled without name collisions.
+Application images run as a non-root user.
 
-In monolith:
-- Entire system redeployed
-- Risk of breaking order + delivery
+## Important Remaining Risks
 
-In microservices:
-- Only Payment Service redeployed
-- Order and Delivery continue running
+### 1. Make payment state authoritative
 
----
+Redis currently provides a durable-enough decision cache for the demo, but it is
+not a payment ledger. A real Payment Service needs its own database with a unique
+idempotency key, provider transaction ID, amount/currency, explicit state
+machine, audit history, and reconciliation process.
 
-### Another scenario: scale problem
+### 2. Persist delivery work
 
-Food festival → sudden spike in orders
+Delivery assignment is currently only a log statement. Add a Delivery-owned
+database and idempotency table before integrating an external courier provider.
 
-Monolith:
-- Scale whole system (wasteful)
+### 3. Complete dead-letter operations
 
-Microservices:
-- Scale only **Order Service**
+Contract-invalid JSON objects go to dead-letter topics, but malformed JSON can
+still fail during deserialization and transient failures retry without bounded
+backoff. Add byte-level decode handling, retry topics, DLQ alerts, retention
+policy, and an audited replay tool.
 
-👉 This is real-world cost optimization.
+Published outbox rows also need a retention or archival job so the table does
+not grow without bound.
 
----
-
-## 3. The hidden complexity (mapped to our system)
-
-Let’s walk through a real failure.
-
-User places order → Order Service works fine  
-But Payment Service is down.
-
-Now what?
-
-- Order already created
-- Payment not done
-
-System is now **inconsistent**.
-
-👉 This is the fundamental problem microservices introduce.
-
----
-
-## 4. Eventual consistency (explained using our flow)
-
-In our system:
-
-1. Order Service creates order → status = PENDING
-2. Payment Service processes later
-
-For a short time:
-- Order exists
-- Payment not completed
-
-👉 This is *expected*
-
-Eventually:
-- Payment succeeds → COMPLETED
-- OR fails → CANCELLED
-
-This is called **eventual consistency**.
-
----
-
-## 5. Why we use Kafka (not just theory)
-
-Let’s compare two approaches in OUR system:
-
-### Approach 1: HTTP call
-Order Service → Payment Service
-
-Problems:
-- If Payment is slow → Order is slow
-- If Payment is down → Order fails
-
----
-
-### Approach 2: Kafka (what we implemented)
-Order Service → emits event → Kafka → Payment Service consumes
-
-Now:
-- Order Service does NOT wait
-- Payment can process later
-- System becomes resilient
-
-👉 This is why event-driven architecture exists
-
----
-
-## 6. Saga pattern (explained with exact flow)
-
-Let’s trace OUR system step by step:
-
-### Step 1: Order created
-Order Service:
-- Save order → PENDING
-- Emit ORDER_CREATED
-
-### Step 2: Payment Service reacts
-- Receives event
-- Processes payment
-
----
-
-### Case 1: Payment success
-- Emit PAYMENT_SUCCESS
-- Order → COMPLETED
-- Delivery triggered
-
----
-
-### Case 2: Payment fails
-- Emit PAYMENT_FAILED
-- Order Service updates → CANCELLED
-
-👉 This “undo logic” is called **compensation**
-
----
-
-👉 Important insight:
-We are NOT rolling back.
-We are **moving forward with corrective actions**.
-
----
-
-## 7. Idempotency (real bug scenario)
-
-Let’s say Kafka sends same event twice:
-
-ORDER_CREATED(order_id=123)
-ORDER_CREATED(order_id=123)
-
-Without idempotency:
-- Payment processed twice ❌
-
-With idempotency:
-- First event processed
-- Second ignored
-
-👉 In our system we store event_id in Redis
-
----
-
-## 8. Failure handling (mapped to our services)
-
-### Scenario: Payment service crashes mid-processing
-
-We handle this using:
-
-#### Retry
-Payment tries again
-
-#### Backoff
-Wait 1s → 2s → 4s
-
-#### Circuit breaker (conceptual here)
-If payment keeps failing:
-- Stop hitting it temporarily
-
-👉 Prevents system-wide slowdown
-
----
-
-## 9. Observability (seen in our system)
-
-Let’s say a user complains:
-“Money deducted but order cancelled”
-
-Without observability:
-- You guess
-
-With observability:
-- Check logs using correlation_id
-- Trace flow across services
-- Identify exact failure point
-
-👉 This is why we added:
-- Logging
-- Correlation IDs
-- Metrics
-
----
-
-## 10. Final mental model (very important)
-
-Think of our system like this:
-
-Order Service → "I created an order"  
-Payment Service → "I handled payment"  
-Delivery Service → "I will deliver"
-
-No one controls everything.
-
-👉 System works via **cooperation, not control**
-
----
-
-# 🏗️ PART 2: SYSTEM DESIGN
-
-## Services
-- API Gateway
-- Order Service
-- Payment Service
-- Delivery Service
-
-## Infra
-- PostgreSQL (data)
-- Kafka (events)
-- Redis (cache/idempotency)
-
----
-
-# 💻 PART 3: IMPLEMENTATION (RUNNABLE)
-
----
-
-# STEP 1: Database Model (Order Service)
-
-```python
-from sqlalchemy import Column, Integer, String
-from sqlalchemy.ext.declarative import declarative_base
-
-Base = declarative_base()
-
-class Order(Base):
-    __tablename__ = "orders"
-    id = Column(Integer, primary_key=True)
-    status = Column(String)  # PENDING, COMPLETED, CANCELLED
-```
-
----
-
-# STEP 2: Order Service (Saga Start)
-
-```python
-from fastapi import FastAPI
-from sqlalchemy.orm import sessionmaker
-from common.kafka_client import publish
-import uuid
-
-app = FastAPI()
-
-@app.post("/orders")
-def create_order():
-    order_id = str(uuid.uuid4())
-
-    # Save to DB with PENDING
-
-    event = {
-        "event_id": str(uuid.uuid4()),
-        "event_type": "ORDER_CREATED",
-        "order_id": order_id
-    }
-
-    publish("orders", event)
-
-    return {"order_id": order_id}
-```
-
----
-
-# STEP 3: Payment Service (With Failure Simulation)
-
-```python
-from kafka import KafkaConsumer
-import random, json
-
-processed_events = set()
-
-consumer = KafkaConsumer(
-    'orders',
-    bootstrap_servers='kafka:9092',
-    value_deserializer=lambda x: json.loads(x.decode())
-)
-
-for msg in consumer:
-    event = msg.value
-
-    if event['event_id'] in processed_events:
-        continue
-
-    processed_events.add(event['event_id'])
-
-    if event['event_type'] == 'ORDER_CREATED':
-        order_id = event['order_id']
-
-        success = random.choice([True, False])
-
-        new_event = {
-            "event_type": "PAYMENT_SUCCESS" if success else "PAYMENT_FAILED",
-            "order_id": order_id
-        }
-
-        print(new_event)
-```
-
----
-
-# STEP 4: Order Service (Compensation Logic)
-
-```python
-if event['event_type'] == 'PAYMENT_FAILED':
-    order.status = "CANCELLED"
-
-elif event['event_type'] == 'PAYMENT_SUCCESS':
-    order.status = "COMPLETED"
-```
-
----
-
-# STEP 5: Retry Logic
-
-```python
-import time
-
-def retry(func):
-    for i in range(3):
-        try:
-            return func()
-        except Exception:
-            time.sleep(2 ** i)
-```
-
----
-
-# STEP 6: Idempotency using Redis
-
-```python
-import redis
-r = redis.Redis(host='redis', port=6379)
-
-if r.get(event_id):
-    return
-
-r.set(event_id, "processed")
-```
-
----
-
-# STEP 7: Docker Compose (FULL RUN)
-
-```yaml
-version: '3.8'
-
-services:
-  kafka:
-    image: bitnami/kafka
-
-  postgres:
-    image: postgres
-    environment:
-      POSTGRES_PASSWORD: password
-
-  redis:
-    image: redis
-
-  order-service:
-    build: ./order-service
-
-  payment-service:
-    build: ./payment-service
-
-  delivery-service:
-    build: ./delivery-service
-
-  api-gateway:
-    build: ./api-gateway
-    ports:
-      - "8000:8000"
-```
-
----
-
-# ▶️ RUN
-
-```bash
-docker-compose up --build
-```
-
----
-
-# 🔄 FLOW (WITH FAILURE)
-
-1. Order created
-2. Event → Kafka
-3. Payment randomly fails
-4. If fail → Order CANCELLED
-5. If success → Delivery triggered
-
----
-
-# 🚀 WHAT MAKES THIS ADVANCED
-
-✔ Real DB model  
-✔ Saga implemented  
-✔ Failure simulation  
-✔ Idempotency  
-✔ Retry logic  
-✔ Event-driven system  
-
----
-
-# 🎯 FINAL UNDERSTANDING
-
-You now understand:
-
-- WHY microservices exist
-- WHY they fail
-- HOW to fix failures
-- HOW real systems are built
-
----
-
-# 🔭 PART 6: OBSERVABILITY (LOGGING + TRACING + METRICS)
-
-Observability answers three questions:
-- **What happened?** (logs)
-- **Where did it happen?** (tracing)
-- **How often / how fast?** (metrics)
-
-We’ll implement:
-- Structured logging (JSON)
-- Correlation ID propagation
-- Basic tracing (request spans)
-- Prometheus metrics
-
----
-
-## 6.1 Structured Logging (JSON)
-
-### Why?
-Plain logs are hard to search across services. JSON logs are machine-friendly.
-
-### common/logging.py
-
-```python
-import logging, json, sys
-
-class JsonFormatter(logging.Formatter):
-    def format(self, record):
-        log = {
-            "level": record.levelname,
-            "message": record.getMessage(),
-            "logger": record.name,
-            "time": self.formatTime(record, self.datefmt),
-        }
-        # optional extras
-        if hasattr(record, "correlation_id"):
-            log["correlation_id"] = record.correlation_id
-        return json.dumps(log)
-
-
-def get_logger(name):
-    logger = logging.getLogger(name)
-    logger.setLevel(logging.INFO)
-
-    handler = logging.StreamHandler(sys.stdout)
-    handler.setFormatter(JsonFormatter())
-
-    if not logger.handlers:
-        logger.addHandler(handler)
-    return logger
-```
-
----
-
-## 6.2 Correlation ID (Request Tracing Across Services)
-
-### Concept
-Every request gets a unique ID that travels through all services.
-
-Header used:
-```
-X-Correlation-ID
-```
-
----
-
-### common/context.py
-
-```python
-from contextvars import ContextVar
-
-correlation_id_var = ContextVar("correlation_id", default=None)
-
-
-def set_correlation_id(cid):
-    correlation_id_var.set(cid)
-
-
-def get_correlation_id():
-    return correlation_id_var.get()
-```
-
----
-
-### FastAPI Middleware (add to every service)
-
-```python
-from fastapi import Request
-import uuid
-from common.context import set_correlation_id
-
-async def correlation_middleware(request: Request, call_next):
-    cid = request.headers.get("X-Correlation-ID", str(uuid.uuid4()))
-    set_correlation_id(cid)
-
-    response = await call_next(request)
-    response.headers["X-Correlation-ID"] = cid
-    return response
-```
-
----
-
-### Using Correlation ID in Logs
-
-```python
-from common.logging import get_logger
-from common.context import get_correlation_id
-
-logger = get_logger(__name__)
-
-logger.info("order created", extra={"correlation_id": get_correlation_id()})
-```
-
----
-
-## 6.3 Propagating Correlation ID via Kafka
-
-### Why?
-Events must carry tracing context.
-
-```python
-event = {
-  "event_id": "...",
-  "correlation_id": get_correlation_id(),
-  "event_type": "ORDER_CREATED",
-  "payload": {...}
-}
-```
-
-Consumers must extract and set it:
-
-```python
-from common.context import set_correlation_id
-
-set_correlation_id(event.get("correlation_id"))
-```
-
----
-
-## 6.4 Basic Tracing (Spans)
-
-### Concept
-A request is broken into steps (spans):
-- API Gateway span
-- Order Service span
-- Payment Service span
-
-We’ll implement lightweight tracing logs.
-
-```python
-import time
-
-class Span:
-    def __init__(self, name, logger, cid):
-        self.name = name
-        self.logger = logger
-        self.cid = cid
-
-    def __enter__(self):
-        self.start = time.time()
-        self.logger.info(f"start:{self.name}", extra={"correlation_id": self.cid})
-
-    def __exit__(self, exc_type, exc, tb):
-        dur = time.time() - self.start
-        self.logger.info(f"end:{self.name} duration={dur}", extra={"correlation_id": self.cid})
-```
-
-Usage:
-
-```python
-from common.context import get_correlation_id
-from common.logging import get_logger
-
-logger = get_logger(__name__)
-
-with Span("create_order", logger, get_correlation_id()):
-    # business logic
-    pass
-```
-
----
-
-## 6.5 Metrics with Prometheus
-
-### Why?
-We need numbers:
-- Requests per second
-- Error rate
-- Latency
-
----
-
-### Install
-
-```bash
-pip install prometheus_client
-```
-
----
-
-### Add Metrics to FastAPI
-
-```python
-from prometheus_client import Counter, Histogram, generate_latest
-from fastapi import Response
-import time
-
-REQUEST_COUNT = Counter("request_count", "Total requests", ["service", "endpoint"])
-REQUEST_LATENCY = Histogram("request_latency_seconds", "Latency", ["service", "endpoint"])
-
-@app.middleware("http")
-async def metrics_middleware(request, call_next):
-    start = time.time()
-
-    response = await call_next(request)
-
-    latency = time.time() - start
-
-    REQUEST_COUNT.labels("order-service", request.url.path).inc()
-    REQUEST_LATENCY.labels("order-service", request.url.path).observe(latency)
-
-    return response
-
-@app.get("/metrics")
-def metrics():
-    return Response(generate_latest(), media_type="text/plain")
-```
-
----
-
-## 6.6 Prometheus + Grafana (Docker)
-
-Add to docker-compose:
-
-```yaml
-prometheus:
-  image: prom/prometheus
-
-grafana:
-  image: grafana/grafana
-  ports:
-    - "3000:3000"
-```
-
----
-
-## 6.7 What You Can Now Demonstrate
-
-In your demo:
-
-1. Place order
-2. Show logs with same correlation ID across services
-3. Show failure in payment
-4. Show compensation logs
-5. Show metrics endpoint
-
-👉 This is **real production observability**
-
----
-
-# 🏁 CONCLUSION
-
-You now have:
-
-✔ Microservices architecture  
-✔ Event-driven system  
-✔ Saga + failure handling  
-✔ Idempotency + retries  
-✔ Structured logging  
-✔ Distributed tracing  
-✔ Metrics + monitoring  
-
----
-
-👉 This is a **complete production-grade distributed system blueprint**.
-
-Very few engineers can build and explain this end-to-end.
-
----
-
+### 4. Govern contract evolution
+
+The code now validates a shared envelope. Move the contract to JSON Schema or
+Avro and enforce backward/forward compatibility in CI before adding version 2.
+
+### 5. Improve operations and security
+
+- Replace development credentials with managed secrets.
+- Keep Kafka, Redis, and PostgreSQL off public host ports.
+- Add authentication, authorization, rate limiting, and request-size limits.
+- Add readiness probes for dependencies and graceful consumer shutdown.
+- Export metrics from every process and adopt OpenTelemetry traces.
+- Pin images by digest, scan dependencies, and use read-only root filesystems.
+- Add database migrations (Alembic); do not use `create_all` for production.
+
+## Recommended Delivery Order
+
+1. Migration tooling, especially before changing existing tables.
+2. Payment ledger and provider idempotency.
+3. Retry topics, malformed-message handling, and DLQ operations.
+4. Delivery persistence.
+5. Authentication, secrets, tracing, dashboards, and deployment manifests.
+
+This order tackles data loss and duplicate financial effects before adding more
+platform machinery.

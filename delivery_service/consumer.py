@@ -4,6 +4,9 @@ import json
 import time
 from common.logging import get_logger
 from common.context import set_correlation_id
+from common.config import KAFKA_BOOTSTRAP_SERVERS
+from common.events import create_rejected_event, validate_event
+from common.kafka_client import publish
 
 logger = get_logger(__name__)
 
@@ -13,10 +16,10 @@ def create_consumer():
         try:
             return KafkaConsumer(
                 'payments',
-                bootstrap_servers='kafka:9092',
+                bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS,
                 value_deserializer=lambda x: json.loads(x.decode()),
                 auto_offset_reset='earliest',
-                enable_auto_commit=True,
+                enable_auto_commit=False,
                 group_id='delivery-service-group',
             )
         except NoBrokersAvailable:
@@ -31,9 +34,23 @@ for msg in consumer:
     set_correlation_id(event.get('correlation_id'))
     logger.info("received payment event", extra={'event': event})
 
-    if event['event_type'] == 'PAYMENT_SUCCESS':
-        logger.info("delivery assigned", extra={'order_id': event['order_id']})
-    elif event['event_type'] == 'PAYMENT_FAILED':
-        logger.info("delivery skipped", extra={'order_id': event['order_id']})
-    else:
-        logger.info("unhandled payment event type", extra={'event_type': event['event_type'], 'order_id': event['order_id']})
+    try:
+        validate_event(event, {'PAYMENT_SUCCESS', 'PAYMENT_FAILED'})
+        order_id = event['payload']['order_id']
+        if event['event_type'] == 'PAYMENT_SUCCESS':
+            logger.info("delivery assigned", extra={'order_id': order_id})
+        else:
+            logger.info("delivery skipped", extra={'order_id': order_id})
+        consumer.commit()
+    except (KeyError, TypeError, ValueError) as exc:
+        try:
+            publish('payments-dlq', create_rejected_event('payments', event, exc))
+        except Exception:
+            logger.exception("payment dead-letter publish failed")
+            time.sleep(2)
+            continue
+        consumer.commit()
+        logger.error("payment event rejected", extra={'error': str(exc), 'event': event})
+    except Exception:
+        logger.exception("payment event handling failed", extra={'event': event})
+        time.sleep(2)
